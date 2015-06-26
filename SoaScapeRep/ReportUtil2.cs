@@ -34,6 +34,15 @@ namespace SoaScapeRep
         private bool m_useFileSystem = false;
         private string m_rootURL = "";
 
+        private string m_userid = "";
+        private string m_password = "";
+        private string m_domain = "";
+        private bool m_windowsAuthentication = false;
+
+        private bool hasCredentials = false; // this forces acquering new credentials
+        //System.Net.CredentialCache applCredentialCache;
+        System.Net.ICredentials m_credentials;
+
         const string NAME_SPACE_URN = "urn:soascape";
         const int MAX_QUERIES = 100;
 
@@ -83,6 +92,20 @@ namespace SoaScapeRep
             set { m_rootURL = value; }
         }
 
+        public bool UseFileSystem
+        {
+            get { return m_useFileSystem; }
+            set { m_useFileSystem = value; }
+        }
+
+        public bool UseWindowsAuthentication
+        {
+            get { return m_windowsAuthentication; }
+            set { m_windowsAuthentication = value; }
+        }
+
+        
+
         #endregion
 
         #region PublicFunctions
@@ -90,6 +113,13 @@ namespace SoaScapeRep
         public void ClearLastError()
         {
             m_lastError = "";
+        }
+
+        public void SetBasicAuthentication(string domain, string uid, string password)
+        {
+            m_domain = domain;
+            m_userid = uid;
+            m_password = password;
         }
 
         public DirectoryInfo GetLoggingDirectory()
@@ -118,10 +148,29 @@ namespace SoaScapeRep
         }
 
 
-        public bool WriteReports(bool stopOnError = false)
+        public bool WriteReports(string dbPath = null, bool stopOnError = false)
         {
+            bool retValue = false;
+            bool endpointsLoaded = true;
             try
             {
+                if (!SoaBrowser.IsLoaded())
+                {
+                    if (dbPath != null) retValue = SoaBrowser.LoadDB(dbPath);
+                    if (!retValue) return false;
+                }
+                endpointsLoaded = SoaBrowser.IsRegistryLoaded;
+
+                if (!endpointsLoaded)
+                {
+                    if (!m_useFileSystem)
+                    {
+                        if (!getCredentials()) return false;
+                    }
+                    foreach (ServiceDomainEntity dom in SoaBrowser.AllServiceDomains)
+                        foreach (EndpointEntity ep in dom.AllMediatedEndpoints) ep.SetProtectedEndpoint(getProtectedEndpoint(ep.UrlRegistryFolder));
+                }
+                
                 DirectoryInfo outDir;
                 DirectoryInfo logDir = GetLoggingDirectory();
                 m_logStream = createLogFile(logDir, "reportLog");
@@ -694,6 +743,7 @@ namespace SoaScapeRep
                                 wr.WriteElementString("targetNamespace", ep.Parent.TargetNamespace);
                                 wr.WriteElementString("endpointName", ep.IntermediaryGivenName);
                                 wr.WriteElementString("gateway", ep.Intermediary.Name);
+                                wr.WriteElementString("resolutionPath", ep.ResolutionPath);
                                 wr.WriteElementString("application", ep.ProvidingApplication.DisplayNameReport);
                                 wr.WriteElementString("applicationVersion", ep.ProvidingApplication.Version);
                                 wr.WriteElementString("businessUnit", ep.ProvidingApplication.BusinessUnit.Name);
@@ -942,6 +992,84 @@ namespace SoaScapeRep
         }
 
 
+        private string getProtectedEndpoint(string urlRegistryFolder)
+        {
+            string retValue = "";
+            if ((urlRegistryFolder == null) || (urlRegistryFolder.Length < 3)) return retValue;
+            try
+            {
+                string urlRegistryFolder2 = urlRegistryFolder;
+                if (m_rootURL.Length > 0) urlRegistryFolder2 = replaceHost(urlRegistryFolder);
+                XmlDocument doc = new XmlDocument();
+                if (m_useFileSystem)
+                {
+                    string physicalUrlFilePath;
+                    if (System.Web.HttpContext.Current == null) // This means the library is invoked from a desktop application
+                    {
+                        physicalUrlFilePath = urlRegistryFolder2.Replace('/', '\\') + "index.xml";
+                    }
+                    else
+                    {
+                        urlRegistryFolder2 = removeHost(urlRegistryFolder2);
+                        // http://stackoverflow.com/questions/1190196/using-server-mappath-in-external-c-sharp-classes-in-asp-net
+                        physicalUrlFilePath = System.Web.HttpContext.Current.Server.MapPath(urlRegistryFolder2 + "index.xml");
+                    }
+                    string physicalFilePath = HttpUtility.UrlDecode(physicalUrlFilePath);
+                    doc.Load(physicalFilePath);
+                }
+                else
+                {
+                    XmlUrlResolver resolver = new XmlUrlResolver();
+                    ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
+                    resolver.Credentials = m_credentials;
+                    doc.XmlResolver = resolver;
+                    doc.Load(urlRegistryFolder2 + "index.xml");
+                }
+                XmlNamespaceManager ns = new XmlNamespaceManager(doc.NameTable); // Fuck SelectSingleNode!
+                XmlElement root = doc.DocumentElement;
+                foreach (XmlNode aNode in root.ChildNodes)
+                {
+                    if (aNode.Name.Equals("protectedEndpoint"))
+                    {
+                        retValue = aNode.InnerText;
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            { // some logging
+                string err = "Failed reading index.xml from: " + urlRegistryFolder + "\n " + ex.Message.ToString();
+                if (ex.InnerException != null) err += ex.InnerException.Message;
+                if (m_logStream != null) m_logStream.WriteLine(err);
+            }
+            return retValue;
+        }
+
+
+        private bool getCredentials()
+        {
+            try
+            {
+                if (m_windowsAuthentication)
+                    m_credentials = System.Net.CredentialCache.DefaultCredentials;
+                else
+                    m_credentials = new System.Net.NetworkCredential(m_userid, m_password, m_domain);
+                hasCredentials = true;
+            }
+            catch (Exception ex)
+            {
+                string err;
+                if (m_windowsAuthentication)
+                    err = "ERR: Unable to get credentials for Windows Authentication \n" + ex.Message;
+                else
+                    err = "ERR: Unable to get credentials for userid: " + m_userid + " domain: " + m_domain + "\n" + ex.Message;
+
+                if (ex.InnerException != null) err += ex.InnerException.Message;
+                if (m_logStream != null) m_logStream.WriteLine(err);
+                hasCredentials = false;
+            }
+            return hasCredentials;
+        }
 
 
         //  
